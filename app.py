@@ -295,6 +295,13 @@ HTML_TEMPLATE = r"""
             <div class="drop-zone-hint">ou clica para selecionar o ficheiro (.xlsx)</div>
             <input type="file" id="fileInput" accept=".xlsx,.xls" multiple>
         </div>
+        
+        <div style="margin-top: 15px; margin-bottom: 5px;" id="mergeOption">
+            <label style="cursor: pointer; font-size: 0.95rem; color: #a0a0c0; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                <input type="checkbox" id="mergeCheckbox" style="width: 16px; height: 16px; cursor: pointer;">
+                Juntar todos os ficheiros num único Excel
+            </label>
+        </div>
 
         <!-- PROCESSING -->
         <div class="processing" id="processing">
@@ -357,6 +364,7 @@ HTML_TEMPLATE = r"""
 
             // Show processing
             dropZone.style.display = 'none';
+            document.getElementById('mergeOption').style.display = 'none';
             processing.style.display = 'block';
             result.style.display = 'none';
 
@@ -364,6 +372,11 @@ HTML_TEMPLATE = r"""
             const formData = new FormData();
             for (let i = 0; i < validFiles.length; i++) {
                 formData.append('file', validFiles[i]);
+            }
+            
+            const mergeCheckbox = document.getElementById('mergeCheckbox');
+            if (mergeCheckbox && mergeCheckbox.checked) {
+                formData.append('merge', 'true');
             }
 
             fetch('/transformar', {
@@ -447,6 +460,7 @@ HTML_TEMPLATE = r"""
 
         function resetForm() {
             dropZone.style.display = 'block';
+            document.getElementById('mergeOption').style.display = 'block';
             processing.style.display = 'none';
             result.style.display = 'none';
             fileInput.value = '';
@@ -688,64 +702,102 @@ def transformar():
     if not files or files[0].filename == '':
         return jsonify({'error': 'Nenhum ficheiro selecionado'}), 400
 
+    merge = request.form.get('merge') == 'true'
+
     try:
         import zipfile
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        processed_files = []
         
         total_linhas_all = 0
         processados_all = 0
         ignorados_all = 0
         previews = []
 
-        for file in files:
-            # Ler o ficheiro Excel
-            df_input = pd.read_excel(file, header=None)
-            total_linhas = len(df_input)
-            total_linhas_all += total_linhas
+        if merge:
+            # Junta todos os ficheiros num unico DataFrame
+            all_df_finals = []
+            for file in files:
+                df_input = pd.read_excel(file, header=None)
+                total_linhas_all += len(df_input)
+                
+                df_final, ignorados = transformar_dataframe(df_input)
+                processados_all += len(df_final)
+                ignorados_all += ignorados
+                all_df_finals.append(df_final)
 
-            # Transformar
-            df_final, ignorados = transformar_dataframe(df_input)
-            processados = len(df_final)
+            df_final_merged = pd.concat(all_df_finals, ignore_index=True) if all_df_finals else pd.DataFrame()
             
-            processados_all += processados
-            ignorados_all += ignorados
-
-            # Gerar nome do ficheiro de saida
-            safe_name = "".join(c for c in file.filename if c.isalnum() or c in (' ', '.', '_')).rstrip()
-            nome_saida = f'formatado_{safe_name}'
+            nome_saida = f'lote_clientes_juntos_{timestamp}.xlsx'
             caminho_saida = os.path.join(OUTPUT_DIR, nome_saida)
-
-            # Exportar e formatar
-            df_final.to_excel(caminho_saida, index=False, engine='openpyxl')
-            formatar_excel(caminho_saida, df_final)
             
-            processed_files.append((nome_saida, caminho_saida))
+            df_final_merged.to_excel(caminho_saida, index=False, engine='openpyxl')
+            formatar_excel(caminho_saida, df_final_merged)
 
             # Preview das primeiras linhas
-            if len(previews) < 5:
-                preview_df = df_final.head(2).copy()
-                date_col = u'Data Fideliza\u00e7\u00e3o'
-                if date_col in preview_df.columns:
-                    def format_date(x):
-                        if pd.isna(x): return ''
-                        if hasattr(x, 'strftime'): return x.strftime('%Y-%m-%d')
-                        return str(x)
-                    preview_df[date_col] = preview_df[date_col].apply(format_date)
-                previews.extend(preview_df.where(pd.notnull(preview_df), None).to_dict('records'))
+            preview_df = df_final_merged.head(5).copy()
+            date_col = u'Data Fideliza\u00e7\u00e3o'
+            if date_col in preview_df.columns:
+                def format_date(x):
+                    if pd.isna(x): return ''
+                    if hasattr(x, 'strftime'): return x.strftime('%Y-%m-%d')
+                    return str(x)
+                preview_df[date_col] = preview_df[date_col].apply(format_date)
+            previews = preview_df.where(pd.notnull(preview_df), None).to_dict('records')
 
-        # Se houver mais de um ficheiro, criar ZIP
-        if len(processed_files) > 1:
-            zip_filename = f'lote_clientes_{timestamp}.zip'
-            zip_path = os.path.join(OUTPUT_DIR, zip_filename)
-            with zipfile.ZipFile(zip_path, 'w') as zipf:
-                for nome_saida, caminho_saida in processed_files:
-                    zipf.write(caminho_saida, arcname=nome_saida)
-            ficheiro_final = zip_filename
-            is_zip = True
-        else:
-            ficheiro_final = processed_files[0][0]
+            ficheiro_final = nome_saida
             is_zip = False
+
+        else:
+            # Comportamento normal: ficheiros separados num ZIP
+            processed_files = []
+            for file in files:
+                # Ler o ficheiro Excel
+                df_input = pd.read_excel(file, header=None)
+                total_linhas = len(df_input)
+                total_linhas_all += total_linhas
+
+                # Transformar
+                df_final, ignorados = transformar_dataframe(df_input)
+                processados = len(df_final)
+                
+                processados_all += processados
+                ignorados_all += ignorados
+
+                # Gerar nome do ficheiro de saida
+                safe_name = "".join(c for c in file.filename if c.isalnum() or c in (' ', '.', '_')).rstrip()
+                nome_saida = f'formatado_{safe_name}'
+                caminho_saida = os.path.join(OUTPUT_DIR, nome_saida)
+
+                # Exportar e formatar
+                df_final.to_excel(caminho_saida, index=False, engine='openpyxl')
+                formatar_excel(caminho_saida, df_final)
+                
+                processed_files.append((nome_saida, caminho_saida))
+
+                # Preview das primeiras linhas
+                if len(previews) < 5:
+                    preview_df = df_final.head(2).copy()
+                    date_col = u'Data Fideliza\u00e7\u00e3o'
+                    if date_col in preview_df.columns:
+                        def format_date(x):
+                            if pd.isna(x): return ''
+                            if hasattr(x, 'strftime'): return x.strftime('%Y-%m-%d')
+                            return str(x)
+                        preview_df[date_col] = preview_df[date_col].apply(format_date)
+                    previews.extend(preview_df.where(pd.notnull(preview_df), None).to_dict('records'))
+
+            # Se houver mais de um ficheiro, criar ZIP
+            if len(processed_files) > 1:
+                zip_filename = f'lote_clientes_{timestamp}.zip'
+                zip_path = os.path.join(OUTPUT_DIR, zip_filename)
+                with zipfile.ZipFile(zip_path, 'w') as zipf:
+                    for nome_saida, caminho_saida in processed_files:
+                        zipf.write(caminho_saida, arcname=nome_saida)
+                ficheiro_final = zip_filename
+                is_zip = True
+            else:
+                ficheiro_final = processed_files[0][0]
+                is_zip = False
 
         return jsonify({
             'total_linhas': total_linhas_all,
