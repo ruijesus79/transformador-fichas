@@ -495,6 +495,44 @@ def extrair_telefones(texto):
     return valid_phones
 
 
+
+
+def remover_duplicados_ricos(df):
+    """Remove duplicados baseados no 'Nome' e 'Telefone'.
+    Em caso de duplicado, mantem a linha com mais valores nao-nulos."""
+    if df.empty:
+        return df, 0
+    
+    linhas_antes = len(df)
+    
+    df_temp = df.copy()
+    
+    def get_dedup_key(row):
+        nome = str(row['Nome']).strip() if pd.notna(row['Nome']) else ""
+        tel = str(row['Telefone']).strip() if pd.notna(row['Telefone']) else ""
+        if not nome and not tel:
+            return f"UNIQUE_{row.name}"
+        return f"{nome}_{tel}"
+        
+    df_temp['_dedup_key'] = df_temp.apply(get_dedup_key, axis=1)
+    
+    def count_valid(row):
+        c = 0
+        for val in row.drop('_dedup_key'):
+            if pd.notna(val) and str(val).strip() not in ('', 'None', '<NA>'):
+                c += 1
+        return c
+    
+    df_temp['_non_null_count'] = df_temp.apply(count_valid, axis=1)
+    df_temp = df_temp.sort_values('_non_null_count', ascending=False)
+    
+    df_dedup = df_temp.drop_duplicates(subset=['_dedup_key'], keep='first').copy()
+    df_dedup = df_dedup.sort_index()
+    df_dedup.drop(columns=['_dedup_key', '_non_null_count'], inplace=True)
+    
+    linhas_removidas = linhas_antes - len(df_dedup)
+    return df_dedup, linhas_removidas
+
 def transformar_dataframe(df_input):
     """Transforma o DataFrame de entrada no formato clientes_final, sem apagar linhas."""
     registos = []
@@ -726,6 +764,9 @@ def transformar():
                 all_df_finals.append(df_final)
 
             df_final_merged = pd.concat(all_df_finals, ignore_index=True) if all_df_finals else pd.DataFrame()
+            df_final_merged, removidos = remover_duplicados_ricos(df_final_merged)
+            processados_all = len(df_final_merged)
+            ignorados_all += removidos
             
             nome_saida = f'lote_clientes_juntos_{timestamp}.xlsx'
             caminho_saida = os.path.join(OUTPUT_DIR, nome_saida)
@@ -758,6 +799,8 @@ def transformar():
 
                 # Transformar
                 df_final, ignorados = transformar_dataframe(df_input)
+                df_final, removidos = remover_duplicados_ricos(df_final)
+                ignorados += removidos
                 processados = len(df_final)
                 
                 processados_all += processados
@@ -862,3 +905,8 @@ if __name__ == '__main__':
     threading.Timer(1.5, open_browser).start()
 
     app.run(host='0.0.0.0', port=port, debug=False)
+
+
+
+
+
