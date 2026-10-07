@@ -8,6 +8,8 @@ Abrir com duplo clique no ficheiro 'Abrir Transformador.bat'
 ou executar: python app.py
 """
 
+import functools
+import gc
 import io
 import os
 import re
@@ -204,8 +206,8 @@ HTML_TEMPLATE = r"""
 
             <div class="options">
                 <label>
-                    <input type="checkbox" id="mergeCheckbox">
-                    Juntar todos os ficheiros num &uacute;nico resultado
+                    <input type="checkbox" id="mergeCheckbox" checked>
+                    Juntar todos os ficheiros num &uacute;nico ficheiro final (recomendado)
                 </label>
                 <label>
                     <input type="checkbox" id="prefixCheckbox">
@@ -236,9 +238,14 @@ HTML_TEMPLATE = r"""
         const mergeCheckbox = document.getElementById('mergeCheckbox');
         const prefixCheckbox = document.getElementById('prefixCheckbox');
 
-        // Lembrar as opcoes escolhidas
-        [['opt_merge', mergeCheckbox], ['opt_prefix', prefixCheckbox]].forEach(([key, el]) => {
-            try { el.checked = localStorage.getItem(key) === '1'; } catch (e) {}
+        // Lembrar as opcoes escolhidas (merge ativo por defeito)
+        [['opt_merge', mergeCheckbox, true], ['opt_prefix', prefixCheckbox, false]].forEach(([key, el, defVal]) => {
+            try {
+                const salvo = localStorage.getItem(key);
+                el.checked = salvo !== null ? salvo === '1' : defVal;
+            } catch (e) {
+                el.checked = defVal;
+            }
             el.addEventListener('change', () => {
                 try { localStorage.setItem(key, el.checked ? '1' : '0'); } catch (e) {}
             });
@@ -270,16 +277,29 @@ HTML_TEMPLATE = r"""
             if (fileInput.files.length > 0) processFiles(fileInput.files);
         });
 
-        function processFiles(files) {
+        let ultimosFicheiros = null;
+
+        function processFiles(files, tentativa = 1) {
             const validFiles = Array.from(files).filter(f => /\.(xlsx|xls|csv)$/i.test(f.name));
             if (validFiles.length === 0) {
                 showError('Seleciona ficheiro(s) Excel (.xlsx, .xls) ou CSV.');
                 return;
             }
+            ultimosFicheiros = validFiles;
 
             uploadArea.style.display = 'none';
             processing.style.display = 'block';
             result.style.display = 'none';
+
+            const procText = document.querySelector('.processing-text');
+            const procHint = document.querySelector('.processing-hint');
+            if (tentativa > 1) {
+                if (procText) procText.textContent = `A ligar ao servidor (tentativa ${tentativa} de 3)...`;
+                if (procHint) procHint.textContent = 'O servidor gratuito no Render entra em repouso após inatividade e demora ~30s a acordar.';
+            } else {
+                if (procText) procText.textContent = 'A organizar ficheiro(s)...';
+                if (procHint) procHint.textContent = 'Ficheiros grandes podem demorar até 1 minuto. Não feches esta página.';
+            }
 
             const formData = new FormData();
             validFiles.forEach(f => formData.append('file', f));
@@ -297,9 +317,14 @@ HTML_TEMPLATE = r"""
                 })
                 .then(data => showSuccess(data, validFiles.length))
                 .catch(error => {
-                    const msg = (error && error.message && error.message !== 'Failed to fetch')
+                    const isNetwork = !error || !error.message || error.message === 'Failed to fetch' || error.message.includes('NetworkError');
+                    if (isNetwork && tentativa < 3) {
+                        setTimeout(() => processFiles(validFiles, tentativa + 1), 3500);
+                        return;
+                    }
+                    const msg = (!isNetwork)
                         ? error.message
-                        : 'Sem ligação ao servidor. Verifica a internet e tenta novamente.';
+                        : 'O servidor na nuvem estava a acordar ou reiniciou. Clica em "Tentar novamente" abaixo para concluir.';
                     showError(msg);
                 });
         }
@@ -359,8 +384,19 @@ HTML_TEMPLATE = r"""
                     <div class="result-title">Não foi possível processar</div>
                     <div class="error-message">${esc(message)}</div>
                     <br>
-                    <button class="btn btn-reset" onclick="resetForm()">&#128260; Tentar novamente</button>
+                    <div style="display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;">
+                        <button class="btn btn-download" style="margin: 0;" onclick="tentarNovamente()">&#128260; Tentar novamente</button>
+                        <button class="btn btn-reset" style="margin: 0; background: rgba(255,255,255,0.1);" onclick="resetForm()">&#128194; Escolher outro</button>
+                    </div>
                 </div>`;
+        }
+
+        function tentarNovamente() {
+            if (ultimosFicheiros && ultimosFicheiros.length > 0) {
+                processFiles(ultimosFicheiros);
+            } else {
+                resetForm();
+            }
         }
 
         function resetForm() {
@@ -368,6 +404,7 @@ HTML_TEMPLATE = r"""
             processing.style.display = 'none';
             result.style.display = 'none';
             fileInput.value = '';
+            ultimosFicheiros = null;
         }
     </script>
 </body>
@@ -393,6 +430,9 @@ RE_EMPRESA = re.compile(
     r'(?<!\w)(LDA|L\.DA|UNIPESSOAL|S\.A\.?|SOCIEDADE|LIMITADA|ASSOCIACAO|CLUBE|RESTAURANTE|'
     r'CAFE|OFICINA|LOJA|HOTEL|HOTELS|CONDOMINIO|JUNTA DE FREGUESIA|CAMARA MUNICIPAL|FUNDACAO|'
     r'COOPERATIVA|COMPANHIA|SA)(?!\w)')
+RE_SERVICO = re.compile(
+    r'\b(FIBRA|ADSL|SAT|TV\+NET|TV\+VOZ|NET\+VOZ|MEO\s*BOX|MEO\s*GO|M[345]O|TARIF|PACOTE|TELEMOVEL|MOVEL)\b',
+    re.I)
 PARTICULAS = {'da', 'de', 'do', 'das', 'dos', 'e', 'd'}
 VALORES_VAZIOS = {'', 'nan', 'none', 'nat', '<na>', 'null'}
 
@@ -417,6 +457,7 @@ PAPEIS_UNICOS = {'nome', 'nif', 'nic', 'email', 'cp', 'morada', 'localidade', 'd
 
 # ─── Funcoes auxiliares ────────────────────────────────────────────────────────
 
+@functools.lru_cache(maxsize=32768)
 def sem_acentos(texto):
     return ''.join(c for c in unicodedata.normalize('NFKD', texto) if not unicodedata.combining(c))
 
@@ -583,6 +624,18 @@ def ler_ficheiro(ficheiro):
                 except UnicodeDecodeError:
                     continue
             raise ErroUtilizador(f'Não foi possível ler o CSV "{nome}" (codificação desconhecida).')
+        if extensao == 'xlsx':
+            wb = openpyxl.load_workbook(io.BytesIO(dados), read_only=True, data_only=True)
+            folhas = []
+            for sname in wb.sheetnames:
+                sheet = wb[sname]
+                rows = list(sheet.iter_rows(values_only=True))
+                if rows:
+                    folhas.append((sname, pd.DataFrame(rows)))
+            wb.close()
+            if not folhas:
+                raise ErroUtilizador(f'O ficheiro "{nome}" não contém dados.')
+            return folhas
         motor = 'xlrd' if extensao == 'xls' else 'openpyxl'
         folhas = pd.read_excel(io.BytesIO(dados), header=None, sheet_name=None, engine=motor)
         return list(folhas.items())
@@ -621,6 +674,8 @@ def perfil_coluna(valores):
         return 'nif'
     if _fracao(textos, lambda t: extrair_telefones(t) and len(re.findall(r'[A-Za-z]', t)) <= 4) > 0.6:
         return 'telefone'
+    if _fracao(textos, lambda t: RE_SERVICO.search(t)) > 0.35:
+        return 'servico'
     if _fracao(textos, lambda t: RE_CP.search(t) or RE_RUA.match(sem_acentos(t).lower())) > 0.5:
         return 'morada'
     if _fracao(textos, lambda t: extrair_telefones(t)) > 0.3:
@@ -791,7 +846,18 @@ def interpretar_linha(valores, papeis, rotulos, origem):
             reg['localidade'] = texto
         elif papel == 'cp':
             m = RE_CP.search(texto)
-            reg['cp'] = f'{m.group(1)}-{m.group(2)}' if m else texto
+            if m:
+                reg['cp'] = f'{m.group(1)}-{m.group(2)}'
+            else:
+                m4 = re.search(r'\b(\d{4})\b', texto)
+                if m4 and len(texto.strip()) <= 10:
+                    reg['cp'] = m4.group(1)
+                else:
+                    tels = extrair_telefones(texto)
+                    if tels:
+                        reg['telefones'].extend(t for t in tels if t not in reg['telefones'])
+                    else:
+                        reg['outros'].append(f'{rotulo}: {texto}')
         elif papel == 'nif':
             reg['nif'] = re.sub(r'\D', '', texto) or texto
         elif papel == 'nic':
@@ -853,23 +919,15 @@ def _para_inteiro_se_possivel(serie):
 
 
 def construir_tabela(registos, prefixo351):
-    max_tel = max((len(r['telefones']) for r in registos), default=0)
-    n_contactos = max(1, max_tel)
     linhas = []
     for r in registos:
         nome = r['nome']
         empresa = e_empresa(nome)
         nome_fmt = nome if empresa else nome_em_titulo(nome)
-        palavras = nome_fmt.split()
+        tels = [(f'+351{tel}' if prefixo351 else tel) for tel in r['telefones']]
         linha = {
-            'Primeiro Nome': nome_fmt if empresa else (palavras[0] if palavras else ''),
-            'Apelido': '' if empresa or len(palavras) < 2 else palavras[-1],
             'Nome Completo': nome_fmt,
-        }
-        for i in range(n_contactos):
-            tel = r['telefones'][i] if i < len(r['telefones']) else ''
-            linha[f'Contacto {i + 1}'] = (f'+351{tel}' if prefixo351 else tel) if tel else ''
-        linha.update({
+            'Contacto': ', '.join(tels),
             'NIF': r['nif'],
             'Nº Cliente': r['nic'],
             'Operadora': r['operadora'],
@@ -883,23 +941,21 @@ def construir_tabela(registos, prefixo351):
             'Outros Dados': ' | '.join(r['outros']),
             'Origem': r['origem'],
             '_n_tel': len(r['telefones']),
-        })
+        }
         linhas.append(linha)
 
     df = pd.DataFrame(linhas)
     if df.empty:
         return df
 
-    colunas_contacto = [c for c in df.columns if c.startswith('Contacto ')]
-    if not prefixo351:
-        for c in colunas_contacto:
-            df[c] = pd.to_numeric(df[c].replace('', pd.NA), errors='coerce').astype('Int64')
     for c in ('NIF', 'Nº Cliente'):
-        df[c] = _para_inteiro_se_possivel(df[c])
-    df['Data Fidelização'] = pd.to_datetime(df['Data Fidelização'], errors='coerce')
+        if c in df.columns:
+            df[c] = _para_inteiro_se_possivel(df[c])
+    if 'Data Fidelização' in df.columns:
+        df['Data Fidelização'] = pd.to_datetime(df['Data Fidelização'], errors='coerce')
 
-    # Remover colunas opcionais totalmente vazias (mantem nome e Contacto 1)
-    obrigatorias = {'Primeiro Nome', 'Apelido', 'Nome Completo', 'Contacto 1', '_n_tel'}
+    # Remover colunas opcionais totalmente vazias (mantem Nome Completo e Contacto)
+    obrigatorias = {'Nome Completo', 'Contacto', '_n_tel'}
     for c in list(df.columns):
         if c in obrigatorias:
             continue
@@ -912,21 +968,25 @@ def construir_tabela(registos, prefixo351):
 
 
 def remover_duplicados(df):
-    """Mesmo Nome + mesmo Contacto 1 = duplicado: fica a linha com mais informacao."""
+    """Mesmo Nome + mesmo primeiro Contacto = duplicado: fica a linha com mais informacao."""
     if df.empty:
         return df, 0
     nome = df['Nome Completo'].fillna('').astype(str).map(lambda s: re.sub(r'\s+', '', sem_acentos(s).upper()))
-    tel = df['Contacto 1'].astype(str).replace({'<NA>': '', 'nan': '', 'None': ''})
+    col_tel = 'Contacto' if 'Contacto' in df.columns else ''
+    tel = df[col_tel].astype(str).replace({'<NA>': '', 'nan': '', 'None': ''}) if col_tel else ''
+    primeiro_tel = tel.map(lambda t: t.split(',')[0].strip() if t else '')
     nif = df['NIF'].astype(str).replace({'<NA>': '', 'nan': '', 'None': ''}) if 'NIF' in df.columns else ''
 
-    chave = nome + '|' + tel
-    sem_tel = tel.eq('')
+    chave = nome + '|' + primeiro_tel
+    sem_tel = primeiro_tel.eq('')
     chave = chave.where(~sem_tel, nome + '|NIF:' + nif)
     unica = (nome.eq('') & sem_tel) | chave.eq('|NIF:')
     chave = chave.where(~unica, '__unica_' + df.index.astype(str))
 
     riqueza = df.replace('', pd.NA).notna().sum(axis=1)
-    ordem = riqueza.sort_values(ascending=False, kind='mergesort').index
+    bonus_tel = (df['Contacto'].fillna('').astype(str).str.strip().ne('')).astype(int) * 10
+    score = riqueza + bonus_tel
+    ordem = score.sort_values(ascending=False, kind='mergesort').index
     mantidos = chave.loc[ordem].drop_duplicates(keep='first').index
     resultado = df.loc[sorted(mantidos)]
     return resultado, len(df) - len(resultado)
@@ -1017,17 +1077,22 @@ def gerar_resultado(registos, pasta, base, prefixo351):
 
 
 def limpar_ficheiros_antigos():
-    limite = time.time() - MINUTOS_VALIDADE * 60
-    for entrada in os.listdir(OUTPUT_DIR):
-        caminho = os.path.join(OUTPUT_DIR, entrada)
-        try:
-            if os.path.getmtime(caminho) < limite:
-                if os.path.isdir(caminho):
-                    shutil.rmtree(caminho, ignore_errors=True)
-                else:
-                    os.remove(caminho)
-        except OSError:
-            pass
+    try:
+        if not os.path.isdir(OUTPUT_DIR):
+            return
+        limite = time.time() - MINUTOS_VALIDADE * 60
+        for entrada in os.listdir(OUTPUT_DIR):
+            caminho = os.path.join(OUTPUT_DIR, entrada)
+            try:
+                if os.path.getmtime(caminho) < limite:
+                    if os.path.isdir(caminho):
+                        shutil.rmtree(caminho, ignore_errors=True)
+                    else:
+                        os.remove(caminho)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def erro_json(mensagem, estado):
@@ -1043,36 +1108,45 @@ def index():
 
 @app.route('/transformar', methods=['POST'])
 def transformar():
-    limpar_ficheiros_antigos()
-    ficheiros = [f for f in request.files.getlist('file') if f and f.filename]
-    if not ficheiros:
-        return erro_json('Nenhum ficheiro selecionado.', 400)
-    for f in ficheiros:
-        if f.filename.rsplit('.', 1)[-1].lower() not in EXTENSOES_PERMITIDAS or '.' not in f.filename:
-            return erro_json(f'Ficheiro inválido: "{f.filename}". Usa .xlsx, .xls ou .csv.', 400)
-
-    juntar = request.form.get('merge') == 'true'
-    prefixo351 = request.form.get('prefixo351') == 'true'
-    token = uuid.uuid4().hex
-    pasta = os.path.join(OUTPUT_DIR, token)
-    os.makedirs(pasta, exist_ok=True)
-
+    token = None
+    pasta = None
     try:
-        lotes, linhas_lidas = [], 0
+        limpar_ficheiros_antigos()
+        ficheiros = [f for f in request.files.getlist('file') if f and f.filename]
+        if not ficheiros:
+            return erro_json('Nenhum ficheiro selecionado.', 400)
         for f in ficheiros:
-            folhas = ler_ficheiro(f)
-            registos = []
-            for nome_folha, df in folhas:
-                origem = f'{f.filename} / {nome_folha}' if len(folhas) > 1 else f.filename
-                regs, n_linhas = processar_folha(df, origem)
-                registos.extend(regs)
-                linhas_lidas += n_linhas
-            lotes.append((nome_base_seguro(f.filename), registos))
+            if f.filename.rsplit('.', 1)[-1].lower() not in EXTENSOES_PERMITIDAS or '.' not in f.filename:
+                return erro_json(f'Ficheiro inválido: "{f.filename}". Usa .xlsx, .xls ou .csv.', 400)
 
-        if juntar or len(lotes) == 1:
-            todos = [r for _, regs in lotes for r in regs]
-            base = lotes[0][0] if len(lotes) == 1 else f'clientes_juntos_{datetime.now():%Y%m%d_%H%M}'
+        juntar = request.form.get('merge', 'true') != 'false'
+        prefixo351 = request.form.get('prefixo351') == 'true'
+        token = uuid.uuid4().hex
+        pasta = os.path.join(OUTPUT_DIR, token)
+        os.makedirs(pasta, exist_ok=True)
+
+        linhas_lidas = 0
+        if juntar or len(ficheiros) == 1:
+            todos = []
+            primeiro_base = nome_base_seguro(ficheiros[0].filename)
+            for f in ficheiros:
+                folhas = ler_ficheiro(f)
+                for nome_folha, df in folhas:
+                    origem = f'{f.filename} / {nome_folha}' if len(folhas) > 1 else f.filename
+                    regs, n_linhas = processar_folha(df, origem)
+                    todos.extend(regs)
+                    linhas_lidas += n_linhas
+                    del df
+                del folhas
+                gc.collect()
+
+            if not todos:
+                raise ErroUtilizador('Não foram encontrados dados de clientes no(s) ficheiro(s).')
+
+            base = primeiro_base if len(ficheiros) == 1 else f'clientes_juntos_{datetime.now():%Y%m%d_%H%M}'
             nomes, stats, df_preview = gerar_resultado(todos, pasta, base, prefixo351)
+            del todos
+            gc.collect()
             downloads = [
                 {'label': 'Descarregar CSV para CallHub', 'tipo': 'csv', 'url': f'/descarregar/{token}/{nomes[1]}'},
                 {'label': 'Descarregar Excel', 'tipo': 'xlsx', 'url': f'/descarregar/{token}/{nomes[0]}'},
@@ -1080,17 +1154,32 @@ def transformar():
         else:
             stats = {'clientes': 0, 'com_contacto': 0, 'sem_contacto': 0, 'multi_contacto': 0, 'duplicados': 0}
             todos_nomes, df_preview, usados = [], None, set()
-            for base, regs in lotes:
-                if not regs:
+            for f in ficheiros:
+                folhas = ler_ficheiro(f)
+                registos = []
+                for nome_folha, df in folhas:
+                    origem = f'{f.filename} / {nome_folha}' if len(folhas) > 1 else f.filename
+                    regs, n_linhas = processar_folha(df, origem)
+                    registos.extend(regs)
+                    linhas_lidas += n_linhas
+                    del df
+                del folhas
+                gc.collect()
+
+                if not registos:
                     continue
+                base = nome_base_seguro(f.filename)
                 while base in usados:
                     base += '_2'
                 usados.add(base)
-                nomes, st, df_p = gerar_resultado(regs, pasta, base, prefixo351)
+                nomes, st, df_p = gerar_resultado(registos, pasta, base, prefixo351)
                 todos_nomes.extend(nomes)
                 for k in stats:
                     stats[k] += st[k]
                 df_preview = df_p if df_preview is None else df_preview
+                del registos
+                gc.collect()
+
             if not todos_nomes:
                 raise ErroUtilizador('Não foram encontrados dados de clientes nos ficheiros.')
             nome_zip = f'clientes_organizados_{datetime.now():%Y%m%d_%H%M}.zip'
