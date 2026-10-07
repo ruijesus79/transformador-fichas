@@ -883,20 +883,15 @@ def _para_inteiro_se_possivel(serie):
 
 
 def construir_tabela(registos, prefixo351):
-    max_tel = max((len(r['telefones']) for r in registos), default=0)
-    n_contactos = max(1, max_tel)
     linhas = []
     for r in registos:
         nome = r['nome']
         empresa = e_empresa(nome)
         nome_fmt = nome if empresa else nome_em_titulo(nome)
+        tels = [(f'+351{tel}' if prefixo351 else tel) for tel in r['telefones']]
         linha = {
             'Nome Completo': nome_fmt,
-        }
-        for i in range(n_contactos):
-            tel = r['telefones'][i] if i < len(r['telefones']) else ''
-            linha[f'Contacto {i + 1}'] = (f'+351{tel}' if prefixo351 else tel) if tel else ''
-        linha.update({
+            'Contacto': ', '.join(tels),
             'NIF': r['nif'],
             'Nº Cliente': r['nic'],
             'Operadora': r['operadora'],
@@ -910,23 +905,21 @@ def construir_tabela(registos, prefixo351):
             'Outros Dados': ' | '.join(r['outros']),
             'Origem': r['origem'],
             '_n_tel': len(r['telefones']),
-        })
+        }
         linhas.append(linha)
 
     df = pd.DataFrame(linhas)
     if df.empty:
         return df
 
-    colunas_contacto = [c for c in df.columns if c.startswith('Contacto ')]
-    if not prefixo351:
-        for c in colunas_contacto:
-            df[c] = pd.to_numeric(df[c].replace('', pd.NA), errors='coerce').astype('Int64')
     for c in ('NIF', 'Nº Cliente'):
-        df[c] = _para_inteiro_se_possivel(df[c])
-    df['Data Fidelização'] = pd.to_datetime(df['Data Fidelização'], errors='coerce')
+        if c in df.columns:
+            df[c] = _para_inteiro_se_possivel(df[c])
+    if 'Data Fidelização' in df.columns:
+        df['Data Fidelização'] = pd.to_datetime(df['Data Fidelização'], errors='coerce')
 
-    # Remover colunas opcionais totalmente vazias (mantem nome e Contacto 1)
-    obrigatorias = {'Nome Completo', 'Contacto 1', '_n_tel'}
+    # Remover colunas opcionais totalmente vazias (mantem Nome Completo e Contacto)
+    obrigatorias = {'Nome Completo', 'Contacto', '_n_tel'}
     for c in list(df.columns):
         if c in obrigatorias:
             continue
@@ -939,15 +932,17 @@ def construir_tabela(registos, prefixo351):
 
 
 def remover_duplicados(df):
-    """Mesmo Nome + mesmo Contacto 1 = duplicado: fica a linha com mais informacao."""
+    """Mesmo Nome + mesmo primeiro Contacto = duplicado: fica a linha com mais informacao."""
     if df.empty:
         return df, 0
     nome = df['Nome Completo'].fillna('').astype(str).map(lambda s: re.sub(r'\s+', '', sem_acentos(s).upper()))
-    tel = df['Contacto 1'].astype(str).replace({'<NA>': '', 'nan': '', 'None': ''})
+    col_tel = 'Contacto' if 'Contacto' in df.columns else ''
+    tel = df[col_tel].astype(str).replace({'<NA>': '', 'nan': '', 'None': ''}) if col_tel else ''
+    primeiro_tel = tel.map(lambda t: t.split(',')[0].strip() if t else '')
     nif = df['NIF'].astype(str).replace({'<NA>': '', 'nan': '', 'None': ''}) if 'NIF' in df.columns else ''
 
-    chave = nome + '|' + tel
-    sem_tel = tel.eq('')
+    chave = nome + '|' + primeiro_tel
+    sem_tel = primeiro_tel.eq('')
     chave = chave.where(~sem_tel, nome + '|NIF:' + nif)
     unica = (nome.eq('') & sem_tel) | chave.eq('|NIF:')
     chave = chave.where(~unica, '__unica_' + df.index.astype(str))
