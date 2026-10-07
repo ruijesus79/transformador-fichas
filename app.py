@@ -8,6 +8,8 @@ Abrir com duplo clique no ficheiro 'Abrir Transformador.bat'
 ou executar: python app.py
 """
 
+import functools
+import gc
 import io
 import os
 import re
@@ -204,8 +206,8 @@ HTML_TEMPLATE = r"""
 
             <div class="options">
                 <label>
-                    <input type="checkbox" id="mergeCheckbox">
-                    Juntar todos os ficheiros num &uacute;nico resultado
+                    <input type="checkbox" id="mergeCheckbox" checked>
+                    Juntar todos os ficheiros num &uacute;nico ficheiro final (recomendado)
                 </label>
                 <label>
                     <input type="checkbox" id="prefixCheckbox">
@@ -236,9 +238,14 @@ HTML_TEMPLATE = r"""
         const mergeCheckbox = document.getElementById('mergeCheckbox');
         const prefixCheckbox = document.getElementById('prefixCheckbox');
 
-        // Lembrar as opcoes escolhidas
-        [['opt_merge', mergeCheckbox], ['opt_prefix', prefixCheckbox]].forEach(([key, el]) => {
-            try { el.checked = localStorage.getItem(key) === '1'; } catch (e) {}
+        // Lembrar as opcoes escolhidas (merge ativo por defeito)
+        [['opt_merge', mergeCheckbox, true], ['opt_prefix', prefixCheckbox, false]].forEach(([key, el, defVal]) => {
+            try {
+                const salvo = localStorage.getItem(key);
+                el.checked = salvo !== null ? salvo === '1' : defVal;
+            } catch (e) {
+                el.checked = defVal;
+            }
             el.addEventListener('change', () => {
                 try { localStorage.setItem(key, el.checked ? '1' : '0'); } catch (e) {}
             });
@@ -447,6 +454,7 @@ PAPEIS_UNICOS = {'nome', 'nif', 'nic', 'email', 'cp', 'morada', 'localidade', 'd
 
 # ─── Funcoes auxiliares ────────────────────────────────────────────────────────
 
+@functools.lru_cache(maxsize=32768)
 def sem_acentos(texto):
     return ''.join(c for c in unicodedata.normalize('NFKD', texto) if not unicodedata.combining(c))
 
@@ -977,7 +985,7 @@ def _escrever_folha(writer, df, nome_folha):
 
 def gravar_excel(caminho, df_com, df_sem):
     opcoes = {'options': {'strings_to_formulas': False, 'strings_to_urls': False,
-                          'strings_to_numbers': False}}
+                          'strings_to_numbers': False, 'constant_memory': True}}
     with pd.ExcelWriter(caminho, engine='xlsxwriter', date_format='dd/mm/yyyy',
                         datetime_format='dd/mm/yyyy', engine_kwargs=opcoes) as writer:
         _escrever_folha(writer, df_com, 'Clientes')
@@ -1081,26 +1089,34 @@ def transformar():
             if f.filename.rsplit('.', 1)[-1].lower() not in EXTENSOES_PERMITIDAS or '.' not in f.filename:
                 return erro_json(f'Ficheiro inválido: "{f.filename}". Usa .xlsx, .xls ou .csv.', 400)
 
-        juntar = request.form.get('merge') == 'true'
+        juntar = request.form.get('merge', 'true') != 'false'
         prefixo351 = request.form.get('prefixo351') == 'true'
         token = uuid.uuid4().hex
         pasta = os.path.join(OUTPUT_DIR, token)
         os.makedirs(pasta, exist_ok=True)
-        lotes, linhas_lidas = [], 0
-        for f in ficheiros:
-            folhas = ler_ficheiro(f)
-            registos = []
-            for nome_folha, df in folhas:
-                origem = f'{f.filename} / {nome_folha}' if len(folhas) > 1 else f.filename
-                regs, n_linhas = processar_folha(df, origem)
-                registos.extend(regs)
-                linhas_lidas += n_linhas
-            lotes.append((nome_base_seguro(f.filename), registos))
 
-        if juntar or len(lotes) == 1:
-            todos = [r for _, regs in lotes for r in regs]
-            base = lotes[0][0] if len(lotes) == 1 else f'clientes_juntos_{datetime.now():%Y%m%d_%H%M}'
+        linhas_lidas = 0
+        if juntar or len(ficheiros) == 1:
+            todos = []
+            primeiro_base = nome_base_seguro(ficheiros[0].filename)
+            for f in ficheiros:
+                folhas = ler_ficheiro(f)
+                for nome_folha, df in folhas:
+                    origem = f'{f.filename} / {nome_folha}' if len(folhas) > 1 else f.filename
+                    regs, n_linhas = processar_folha(df, origem)
+                    todos.extend(regs)
+                    linhas_lidas += n_linhas
+                    del df
+                del folhas
+                gc.collect()
+
+            if not todos:
+                raise ErroUtilizador('Não foram encontrados dados de clientes no(s) ficheiro(s).')
+
+            base = primeiro_base if len(ficheiros) == 1 else f'clientes_juntos_{datetime.now():%Y%m%d_%H%M}'
             nomes, stats, df_preview = gerar_resultado(todos, pasta, base, prefixo351)
+            del todos
+            gc.collect()
             downloads = [
                 {'label': 'Descarregar CSV para CallHub', 'tipo': 'csv', 'url': f'/descarregar/{token}/{nomes[1]}'},
                 {'label': 'Descarregar Excel', 'tipo': 'xlsx', 'url': f'/descarregar/{token}/{nomes[0]}'},
@@ -1108,17 +1124,32 @@ def transformar():
         else:
             stats = {'clientes': 0, 'com_contacto': 0, 'sem_contacto': 0, 'multi_contacto': 0, 'duplicados': 0}
             todos_nomes, df_preview, usados = [], None, set()
-            for base, regs in lotes:
-                if not regs:
+            for f in ficheiros:
+                folhas = ler_ficheiro(f)
+                registos = []
+                for nome_folha, df in folhas:
+                    origem = f'{f.filename} / {nome_folha}' if len(folhas) > 1 else f.filename
+                    regs, n_linhas = processar_folha(df, origem)
+                    registos.extend(regs)
+                    linhas_lidas += n_linhas
+                    del df
+                del folhas
+                gc.collect()
+
+                if not registos:
                     continue
+                base = nome_base_seguro(f.filename)
                 while base in usados:
                     base += '_2'
                 usados.add(base)
-                nomes, st, df_p = gerar_resultado(regs, pasta, base, prefixo351)
+                nomes, st, df_p = gerar_resultado(registos, pasta, base, prefixo351)
                 todos_nomes.extend(nomes)
                 for k in stats:
                     stats[k] += st[k]
                 df_preview = df_p if df_preview is None else df_preview
+                del registos
+                gc.collect()
+
             if not todos_nomes:
                 raise ErroUtilizador('Não foram encontrados dados de clientes nos ficheiros.')
             nome_zip = f'clientes_organizados_{datetime.now():%Y%m%d_%H%M}.zip'
