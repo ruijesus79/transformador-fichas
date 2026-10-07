@@ -261,9 +261,9 @@ HTML_TEMPLATE = r"""
         function mensagemPorEstado(status) {
             if (status === 413) return 'O ficheiro é demasiado grande (máximo 50 MB).';
             if (status === 502 || status === 503 || status === 504) {
-                return 'O servidor demorou demasiado a responder. Se o site esteve parado, aguarda 1 minuto e tenta novamente.';
+                return 'O servidor demorou a processar esta quantidade de dados. Experimenta carregar em lotes de 2 a 3 ficheiros de cada vez.';
             }
-            return 'Ocorreu um erro inesperado (código ' + status + '). Tenta novamente.';
+            return 'Ocorreu um erro inesperado (código ' + status + '). Tenta novamente ou experimenta carregar em lotes menores.';
         }
 
         dropZone.addEventListener('click', () => fileInput.click());
@@ -1000,18 +1000,15 @@ def _escrever_folha(writer, df, nome_folha):
     livro, folha = writer.book, writer.sheets[nome_folha]
     fmt_cab = livro.add_format({'bold': True, 'font_color': '#FFFFFF', 'bg_color': '#1F4E79',
                                 'align': 'center', 'valign': 'vcenter', 'border': 1, 'text_wrap': True})
-    fmt_zebra = livro.add_format({'bg_color': '#EAF1F8'})
     for i, coluna in enumerate(df.columns):
         folha.write(0, i, coluna, fmt_cab)
-        amostra = [celula_texto(v) for v in df[coluna].head(500)]
+        amostra = [celula_texto(v) for v in df[coluna].head(60)]
         largura = max([len(str(coluna))] + [len(v) for v in amostra]) + 2
         folha.set_column(i, i, min(max(largura, 10), 50))
     folha.set_row(0, 24)
     folha.freeze_panes(1, 0)
     if len(df):
         folha.autofilter(0, 0, len(df), len(df.columns) - 1)
-        folha.conditional_format(1, 0, len(df), len(df.columns) - 1,
-                                 {'type': 'formula', 'criteria': '=MOD(ROW(),2)=0', 'format': fmt_zebra})
 
 
 def gravar_excel(caminho, df_com, df_sem):
