@@ -430,6 +430,9 @@ RE_EMPRESA = re.compile(
     r'(?<!\w)(LDA|L\.DA|UNIPESSOAL|S\.A\.?|SOCIEDADE|LIMITADA|ASSOCIACAO|CLUBE|RESTAURANTE|'
     r'CAFE|OFICINA|LOJA|HOTEL|HOTELS|CONDOMINIO|JUNTA DE FREGUESIA|CAMARA MUNICIPAL|FUNDACAO|'
     r'COOPERATIVA|COMPANHIA|SA)(?!\w)')
+RE_SERVICO = re.compile(
+    r'\b(FIBRA|ADSL|SAT|TV\+NET|TV\+VOZ|NET\+VOZ|MEO\s*BOX|MEO\s*GO|M[345]O|TARIF|PACOTE|TELEMOVEL|MOVEL)\b',
+    re.I)
 PARTICULAS = {'da', 'de', 'do', 'das', 'dos', 'e', 'd'}
 VALORES_VAZIOS = {'', 'nan', 'none', 'nat', '<na>', 'null'}
 
@@ -621,6 +624,18 @@ def ler_ficheiro(ficheiro):
                 except UnicodeDecodeError:
                     continue
             raise ErroUtilizador(f'Não foi possível ler o CSV "{nome}" (codificação desconhecida).')
+        if extensao == 'xlsx':
+            wb = openpyxl.load_workbook(io.BytesIO(dados), read_only=True, data_only=True)
+            folhas = []
+            for sname in wb.sheetnames:
+                sheet = wb[sname]
+                rows = list(sheet.iter_rows(values_only=True))
+                if rows:
+                    folhas.append((sname, pd.DataFrame(rows)))
+            wb.close()
+            if not folhas:
+                raise ErroUtilizador(f'O ficheiro "{nome}" não contém dados.')
+            return folhas
         motor = 'xlrd' if extensao == 'xls' else 'openpyxl'
         folhas = pd.read_excel(io.BytesIO(dados), header=None, sheet_name=None, engine=motor)
         return list(folhas.items())
@@ -659,6 +674,8 @@ def perfil_coluna(valores):
         return 'nif'
     if _fracao(textos, lambda t: extrair_telefones(t) and len(re.findall(r'[A-Za-z]', t)) <= 4) > 0.6:
         return 'telefone'
+    if _fracao(textos, lambda t: RE_SERVICO.search(t)) > 0.35:
+        return 'servico'
     if _fracao(textos, lambda t: RE_CP.search(t) or RE_RUA.match(sem_acentos(t).lower())) > 0.5:
         return 'morada'
     if _fracao(textos, lambda t: extrair_telefones(t)) > 0.3:
@@ -829,7 +846,18 @@ def interpretar_linha(valores, papeis, rotulos, origem):
             reg['localidade'] = texto
         elif papel == 'cp':
             m = RE_CP.search(texto)
-            reg['cp'] = f'{m.group(1)}-{m.group(2)}' if m else texto
+            if m:
+                reg['cp'] = f'{m.group(1)}-{m.group(2)}'
+            else:
+                m4 = re.search(r'\b(\d{4})\b', texto)
+                if m4 and len(texto.strip()) <= 10:
+                    reg['cp'] = m4.group(1)
+                else:
+                    tels = extrair_telefones(texto)
+                    if tels:
+                        reg['telefones'].extend(t for t in tels if t not in reg['telefones'])
+                    else:
+                        reg['outros'].append(f'{rotulo}: {texto}')
         elif papel == 'nif':
             reg['nif'] = re.sub(r'\D', '', texto) or texto
         elif papel == 'nic':
@@ -956,7 +984,9 @@ def remover_duplicados(df):
     chave = chave.where(~unica, '__unica_' + df.index.astype(str))
 
     riqueza = df.replace('', pd.NA).notna().sum(axis=1)
-    ordem = riqueza.sort_values(ascending=False, kind='mergesort').index
+    bonus_tel = (df['Contacto'].fillna('').astype(str).str.strip().ne('')).astype(int) * 10
+    score = riqueza + bonus_tel
+    ordem = score.sort_values(ascending=False, kind='mergesort').index
     mantidos = chave.loc[ordem].drop_duplicates(keep='first').index
     resultado = df.loc[sorted(mantidos)]
     return resultado, len(df) - len(resultado)
@@ -985,7 +1015,7 @@ def _escrever_folha(writer, df, nome_folha):
 
 def gravar_excel(caminho, df_com, df_sem):
     opcoes = {'options': {'strings_to_formulas': False, 'strings_to_urls': False,
-                          'strings_to_numbers': False, 'constant_memory': True}}
+                          'strings_to_numbers': False}}
     with pd.ExcelWriter(caminho, engine='xlsxwriter', date_format='dd/mm/yyyy',
                         datetime_format='dd/mm/yyyy', engine_kwargs=opcoes) as writer:
         _escrever_folha(writer, df_com, 'Clientes')
