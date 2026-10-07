@@ -500,16 +500,24 @@ def nif_valido(valor):
 
 def _digitos_para_telefones(d):
     """Recebe so digitos e devolve a lista de telefones PT (9 digitos) que representam."""
-    if len(d) == 9 and d[0] in '29':
+    if len(d) == 9 and (d[0] in '29' or d.startswith('30')):
         return [d]
-    if len(d) == 12 and d.startswith('351') and d[3] in '29':
+    if len(d) == 12 and d.startswith('351') and (d[3] in '29' or d[3:].startswith('30')):
         return [d[3:]]
-    if len(d) == 14 and d.startswith('00351') and d[5] in '29':
+    if len(d) == 14 and d.startswith('00351') and (d[5] in '29' or d[5:].startswith('30')):
         return [d[5:]]
     if len(d) > 9 and len(d) % 9 == 0:
         partes = [d[i:i + 9] for i in range(0, len(d), 9)]
-        if all(p[0] in '29' for p in partes):
+        if all(p[0] in '29' or p.startswith('30') for p in partes):
             return partes
+    # Se tem mais de 9 dígitos e começa com prefixo válido (ex: float truncado 91419092991803)
+    if len(d) > 9 and (d[0] in '29' or d.startswith('30')):
+        primeiro = d[:9]
+        resto = d[9:]
+        sub = _digitos_para_telefones(resto)
+        if sub:
+            return [primeiro] + sub
+        return [primeiro]
     return []
 
 
@@ -969,28 +977,77 @@ def construir_tabela(registos, prefixo351):
 
 
 def remover_duplicados(df):
-    """Mesmo Nome + mesmo primeiro Contacto = duplicado: fica a linha com mais informacao."""
+    """Agrupa por NIF, NIC ou Nome: combina contactos e nunca envia cliente com contacto para 'Sem Contacto'."""
     if df.empty:
         return df, 0
-    nome = df['Nome Completo'].fillna('').astype(str).map(lambda s: re.sub(r'\s+', '', sem_acentos(s).upper()))
-    col_tel = 'Contacto' if 'Contacto' in df.columns else ''
-    tel = df[col_tel].astype(str).replace({'<NA>': '', 'nan': '', 'None': ''}) if col_tel else ''
-    primeiro_tel = tel.map(lambda t: t.split(',')[0].strip() if t else '')
-    nif = df['NIF'].astype(str).replace({'<NA>': '', 'nan': '', 'None': ''}) if 'NIF' in df.columns else ''
 
-    chave = nome + '|' + primeiro_tel
-    sem_tel = primeiro_tel.eq('')
-    chave = chave.where(~sem_tel, nome + '|NIF:' + nif)
-    unica = (nome.eq('') & sem_tel) | chave.eq('|NIF:')
-    chave = chave.where(~unica, '__unica_' + df.index.astype(str))
+    nif_serie = df['NIF'].fillna('').astype(str).str.strip().replace({'<NA>': '', 'nan': '', 'None': '', '0': ''})
+    nic_serie = df['Nº Cliente'].fillna('').astype(str).str.strip().replace({'<NA>': '', 'nan': '', 'None': '', '0': ''}) if 'Nº Cliente' in df.columns else pd.Series('', index=df.index)
+    nome_serie = df['Nome Completo'].fillna('').astype(str).map(lambda s: re.sub(r'\s+', '', sem_acentos(s).upper()))
 
-    riqueza = df.replace('', pd.NA).notna().sum(axis=1)
-    bonus_tel = (df['Contacto'].fillna('').astype(str).str.strip().ne('')).astype(int) * 10
-    score = riqueza + bonus_tel
-    ordem = score.sort_values(ascending=False, kind='mergesort').index
-    mantidos = chave.loc[ordem].drop_duplicates(keep='first').index
-    resultado = df.loc[sorted(mantidos)]
-    return resultado, len(df) - len(resultado)
+    chaves = []
+    for idx in df.index:
+        nf = nif_serie.at[idx]
+        nc = nic_serie.at[idx]
+        nm = nome_serie.at[idx]
+        if len(nf) == 9:
+            chaves.append(f'NIF:{nf}')
+        elif len(nc) >= 6:
+            chaves.append(f'NIC:{nc}')
+        elif len(nm) >= 4:
+            chaves.append(f'NOME:{nm}')
+        else:
+            chaves.append(f'__UNICA_{idx}')
+
+    df_temp = df.copy()
+    df_temp['chave_grp'] = chaves
+    tem_tel = (df_temp['_n_tel'] > 0).astype(int)
+    riqueza = df_temp.replace('', pd.NA).notna().sum(axis=1)
+    df_temp['score_grp'] = tem_tel * 1000 + df_temp['_n_tel'] * 10 + riqueza
+    df_temp = df_temp.sort_values(by='score_grp', ascending=False, kind='mergesort')
+
+    cols = list(df.columns)
+    col_idx = {name: i for i, name in enumerate(df_temp.columns)}
+    idx_chave = col_idx['chave_grp']
+    idx_contacto = col_idx.get('Contacto')
+
+    grupos = {}
+    for row in df_temp.itertuples(index=False, name=None):
+        ch = row[idx_chave]
+        if ch not in grupos:
+            grupos[ch] = [row]
+        else:
+            grupos[ch].append(row)
+
+    linhas_finais = []
+    for ch, lista in grupos.items():
+        primeira = list(lista[0])
+        d = dict(zip(df_temp.columns, primeira))
+
+        if len(lista) > 1:
+            tels = []
+            for item in lista:
+                c_str = item[idx_contacto] if idx_contacto is not None else ''
+                if c_str and str(c_str).strip():
+                    for t in str(c_str).split(','):
+                        t = t.strip()
+                        if t and t not in tels:
+                            tels.append(t)
+            d['Contacto'] = ', '.join(tels)
+            d['_n_tel'] = len(tels)
+
+            for item in lista[1:]:
+                item_dict = dict(zip(df_temp.columns, item))
+                for c in ('Morada', 'Localidade', 'Código Postal', 'Email', 'Serviço Atual', 'Data Fidelização'):
+                    if c in d and (not d[c] or pd.isna(d[c])):
+                        val = item_dict.get(c)
+                        if val and not pd.isna(val):
+                            d[c] = val
+        linhas_finais.append({c: d[c] for c in cols})
+
+    resultado = pd.DataFrame(linhas_finais)
+    dups = len(df) - len(resultado)
+    return resultado, dups
 
 
 # ─── Exportacao ────────────────────────────────────────────────────────────────
