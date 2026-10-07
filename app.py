@@ -270,16 +270,29 @@ HTML_TEMPLATE = r"""
             if (fileInput.files.length > 0) processFiles(fileInput.files);
         });
 
-        function processFiles(files) {
+        let ultimosFicheiros = null;
+
+        function processFiles(files, tentativa = 1) {
             const validFiles = Array.from(files).filter(f => /\.(xlsx|xls|csv)$/i.test(f.name));
             if (validFiles.length === 0) {
                 showError('Seleciona ficheiro(s) Excel (.xlsx, .xls) ou CSV.');
                 return;
             }
+            ultimosFicheiros = validFiles;
 
             uploadArea.style.display = 'none';
             processing.style.display = 'block';
             result.style.display = 'none';
+
+            const procText = document.querySelector('.processing-text');
+            const procHint = document.querySelector('.processing-hint');
+            if (tentativa > 1) {
+                if (procText) procText.textContent = `A ligar ao servidor (tentativa ${tentativa} de 3)...`;
+                if (procHint) procHint.textContent = 'O servidor gratuito no Render entra em repouso após inatividade e demora ~30s a acordar.';
+            } else {
+                if (procText) procText.textContent = 'A organizar ficheiro(s)...';
+                if (procHint) procHint.textContent = 'Ficheiros grandes podem demorar até 1 minuto. Não feches esta página.';
+            }
 
             const formData = new FormData();
             validFiles.forEach(f => formData.append('file', f));
@@ -297,9 +310,14 @@ HTML_TEMPLATE = r"""
                 })
                 .then(data => showSuccess(data, validFiles.length))
                 .catch(error => {
-                    const msg = (error && error.message && error.message !== 'Failed to fetch')
+                    const isNetwork = !error || !error.message || error.message === 'Failed to fetch' || error.message.includes('NetworkError');
+                    if (isNetwork && tentativa < 3) {
+                        setTimeout(() => processFiles(validFiles, tentativa + 1), 3500);
+                        return;
+                    }
+                    const msg = (!isNetwork)
                         ? error.message
-                        : 'Sem ligação ao servidor. Verifica a internet e tenta novamente.';
+                        : 'O servidor na nuvem estava a acordar ou reiniciou. Clica em "Tentar novamente" abaixo para concluir.';
                     showError(msg);
                 });
         }
@@ -359,8 +377,19 @@ HTML_TEMPLATE = r"""
                     <div class="result-title">Não foi possível processar</div>
                     <div class="error-message">${esc(message)}</div>
                     <br>
-                    <button class="btn btn-reset" onclick="resetForm()">&#128260; Tentar novamente</button>
+                    <div style="display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;">
+                        <button class="btn btn-download" style="margin: 0;" onclick="tentarNovamente()">&#128260; Tentar novamente</button>
+                        <button class="btn btn-reset" style="margin: 0; background: rgba(255,255,255,0.1);" onclick="resetForm()">&#128194; Escolher outro</button>
+                    </div>
                 </div>`;
+        }
+
+        function tentarNovamente() {
+            if (ultimosFicheiros && ultimosFicheiros.length > 0) {
+                processFiles(ultimosFicheiros);
+            } else {
+                resetForm();
+            }
         }
 
         function resetForm() {
@@ -368,6 +397,7 @@ HTML_TEMPLATE = r"""
             processing.style.display = 'none';
             result.style.display = 'none';
             fileInput.value = '';
+            ultimosFicheiros = null;
         }
     </script>
 </body>
@@ -860,10 +890,7 @@ def construir_tabela(registos, prefixo351):
         nome = r['nome']
         empresa = e_empresa(nome)
         nome_fmt = nome if empresa else nome_em_titulo(nome)
-        palavras = nome_fmt.split()
         linha = {
-            'Primeiro Nome': nome_fmt if empresa else (palavras[0] if palavras else ''),
-            'Apelido': '' if empresa or len(palavras) < 2 else palavras[-1],
             'Nome Completo': nome_fmt,
         }
         for i in range(n_contactos):
@@ -899,7 +926,7 @@ def construir_tabela(registos, prefixo351):
     df['Data Fidelização'] = pd.to_datetime(df['Data Fidelização'], errors='coerce')
 
     # Remover colunas opcionais totalmente vazias (mantem nome e Contacto 1)
-    obrigatorias = {'Primeiro Nome', 'Apelido', 'Nome Completo', 'Contacto 1', '_n_tel'}
+    obrigatorias = {'Nome Completo', 'Contacto 1', '_n_tel'}
     for c in list(df.columns):
         if c in obrigatorias:
             continue
@@ -1017,17 +1044,22 @@ def gerar_resultado(registos, pasta, base, prefixo351):
 
 
 def limpar_ficheiros_antigos():
-    limite = time.time() - MINUTOS_VALIDADE * 60
-    for entrada in os.listdir(OUTPUT_DIR):
-        caminho = os.path.join(OUTPUT_DIR, entrada)
-        try:
-            if os.path.getmtime(caminho) < limite:
-                if os.path.isdir(caminho):
-                    shutil.rmtree(caminho, ignore_errors=True)
-                else:
-                    os.remove(caminho)
-        except OSError:
-            pass
+    try:
+        if not os.path.isdir(OUTPUT_DIR):
+            return
+        limite = time.time() - MINUTOS_VALIDADE * 60
+        for entrada in os.listdir(OUTPUT_DIR):
+            caminho = os.path.join(OUTPUT_DIR, entrada)
+            try:
+                if os.path.getmtime(caminho) < limite:
+                    if os.path.isdir(caminho):
+                        shutil.rmtree(caminho, ignore_errors=True)
+                    else:
+                        os.remove(caminho)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def erro_json(mensagem, estado):
@@ -1043,21 +1075,22 @@ def index():
 
 @app.route('/transformar', methods=['POST'])
 def transformar():
-    limpar_ficheiros_antigos()
-    ficheiros = [f for f in request.files.getlist('file') if f and f.filename]
-    if not ficheiros:
-        return erro_json('Nenhum ficheiro selecionado.', 400)
-    for f in ficheiros:
-        if f.filename.rsplit('.', 1)[-1].lower() not in EXTENSOES_PERMITIDAS or '.' not in f.filename:
-            return erro_json(f'Ficheiro inválido: "{f.filename}". Usa .xlsx, .xls ou .csv.', 400)
-
-    juntar = request.form.get('merge') == 'true'
-    prefixo351 = request.form.get('prefixo351') == 'true'
-    token = uuid.uuid4().hex
-    pasta = os.path.join(OUTPUT_DIR, token)
-    os.makedirs(pasta, exist_ok=True)
-
+    token = None
+    pasta = None
     try:
+        limpar_ficheiros_antigos()
+        ficheiros = [f for f in request.files.getlist('file') if f and f.filename]
+        if not ficheiros:
+            return erro_json('Nenhum ficheiro selecionado.', 400)
+        for f in ficheiros:
+            if f.filename.rsplit('.', 1)[-1].lower() not in EXTENSOES_PERMITIDAS or '.' not in f.filename:
+                return erro_json(f'Ficheiro inválido: "{f.filename}". Usa .xlsx, .xls ou .csv.', 400)
+
+        juntar = request.form.get('merge') == 'true'
+        prefixo351 = request.form.get('prefixo351') == 'true'
+        token = uuid.uuid4().hex
+        pasta = os.path.join(OUTPUT_DIR, token)
+        os.makedirs(pasta, exist_ok=True)
         lotes, linhas_lidas = [], 0
         for f in ficheiros:
             folhas = ler_ficheiro(f)
