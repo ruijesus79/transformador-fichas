@@ -23,6 +23,7 @@ import zipfile
 from datetime import date, datetime
 
 import pandas as pd
+import openpyxl
 from flask import Flask, abort, jsonify, request, send_from_directory
 
 app = Flask(__name__)
@@ -1232,7 +1233,8 @@ def erro_interno(_erro):
 
 def open_browser():
     """Abre o browser automaticamente apos o servidor iniciar."""
-    webbrowser.open('http://127.0.0.1:5000')
+    if os.environ.get('SEM_BROWSER') != '1':
+        webbrowser.open('http://127.0.0.1:5000')
 
 
 if __name__ == '__main__':
