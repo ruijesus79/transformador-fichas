@@ -27,6 +27,7 @@ import openpyxl
 from flask import Flask, abort, jsonify, request, send_from_directory
 
 app = Flask(__name__)
+app.json.sort_keys = False
 
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # Limite de 50 MB por pedido
 EXTENSOES_PERMITIDAS = {'xlsx', 'xls', 'csv'}
@@ -470,13 +471,21 @@ def celula_texto(valor):
     if isinstance(valor, float):
         if pd.isna(valor):
             return ''
-        return str(int(valor)) if valor.is_integer() else str(valor)
+        if valor.is_integer():
+            return str(int(valor))
+        if 0.19 < valor < 1.0:
+            casas = f'{valor:.9f}'[2:]
+            if casas[0] in '29' or casas.startswith('30'):
+                return casas
+        return str(valor)
     if isinstance(valor, (pd.Timestamp, datetime, date)):
         if pd.isna(valor):
             return ''
         return valor.strftime('%d/%m/%Y')
     texto = str(valor).strip()
-    return '' if texto.lower() in VALORES_VAZIOS else texto
+    if texto.lower() in VALORES_VAZIOS or not re.search(r'[A-Za-z0-9À-ÿ]', texto):
+        return ''
+    return texto
 
 
 def letra_coluna(indice):
@@ -836,7 +845,14 @@ def interpretar_linha(valores, papeis, rotulos, origem):
             interpretar_meo(texto, reg)
             continue
         if papel in PAPEIS_UNICOS and papel != 'data' and reg.get(papel):
-            reg['outros'].append(f'{rotulo}: {texto}')
+            atual = str(reg.get(papel)).strip()
+            novo = texto.strip()
+            if papel == 'cp':
+                m = RE_CP.search(novo)
+                if m:
+                    novo = f'{m.group(1)}-{m.group(2)}'
+            if sem_acentos(novo).lower() != sem_acentos(atual).lower():
+                reg['outros'].append(f'{rotulo}: {texto}')
             continue
 
         if papel == 'telefone':
@@ -927,16 +943,91 @@ def _para_inteiro_se_possivel(serie):
     return serie.replace('', None)
 
 
+def _extrair_lista_contactos_df(df):
+    """Devolve, para cada linha do DataFrame, a lista ordenada e sem duplicados dos seus contactos."""
+    cols_contacto = [c for c in df.columns if c == 'Contacto' or re.fullmatch(r'Contacto \d+', str(c))]
+    if not cols_contacto:
+        return [[] for _ in range(len(df))]
+
+    matriz_cols = [df[c].tolist() for c in cols_contacto]
+    resultado = []
+    for i in range(len(df)):
+        tels = []
+        for col_vals in matriz_cols:
+            val = col_vals[i]
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            s = str(val).strip()
+            if not s or s.lower() in VALORES_VAZIOS:
+                continue
+            for parte in s.split(','):
+                t = parte.strip()
+                if t and t.lower() not in VALORES_VAZIOS and t not in tels:
+                    tels.append(t)
+        resultado.append(tels)
+    return resultado
+
+
+def _aplicar_colunas_contacto(df, listas_tels=None):
+    """Substitui a coluna 'Contacto' por 'Contacto 1', 'Contacto 2', ... consoante os contactos existentes."""
+    if df.empty:
+        return df
+    if listas_tels is None:
+        listas_tels = _extrair_lista_contactos_df(df)
+
+    max_tels = max((len(t) for t in listas_tels), default=1)
+    max_tels = max(1, max_tels)
+
+    cols_antigas = [c for c in df.columns if c == 'Contacto' or re.fullmatch(r'Contacto \d+', str(c))]
+    outras_cols = [c for c in df.columns if c not in cols_antigas]
+
+    novas_cols_tel = {
+        f'Contacto {k}': [(tels[k - 1] if k <= len(tels) else '') for tels in listas_tels]
+        for k in range(1, max_tels + 1)
+    }
+    df_tels = pd.DataFrame(novas_cols_tel, index=df.index)
+
+    if 'Nome Completo' in outras_cols:
+        pos = outras_cols.index('Nome Completo') + 1
+        cols_antes = outras_cols[:pos]
+        cols_depois = outras_cols[pos:]
+        df_final = pd.concat([df[cols_antes], df_tels, df[cols_depois]], axis=1)
+    else:
+        df_final = pd.concat([df_tels, df[outras_cols]], axis=1)
+
+    df_final['_n_tel'] = [len(t) for t in listas_tels]
+    return df_final
+
+
+def _limpar_colunas_vazias(df, obrigatorias=('Nome Completo', 'Contacto 1', '_n_tel')):
+    """Remove colunas opcionais que estejam 100% vazias no DataFrame."""
+    obrigatorias_set = set(obrigatorias)
+    for c in list(df.columns):
+        if c in obrigatorias_set:
+            continue
+        serie = df[c]
+        if serie.isna().all():
+            df = df.drop(columns=c)
+            continue
+        limpa = serie.astype(str).str.strip().replace({'<NA>': '', 'nan': '', 'None': '', 'null': '', 'NaT': ''})
+        if limpa.eq('').all():
+            df = df.drop(columns=c)
+    if 'Origem' in df.columns and df['Origem'].nunique() <= 1:
+        df = df.drop(columns='Origem')
+    return df
+
+
 def construir_tabela(registos, prefixo351):
     linhas = []
+    listas_tels = []
     for r in registos:
         nome = r['nome']
         empresa = e_empresa(nome)
         nome_fmt = nome if empresa else nome_em_titulo(nome)
         tels = [(f'+351{tel}' if prefixo351 else tel) for tel in r['telefones']]
+        listas_tels.append(tels)
         linha = {
             'Nome Completo': nome_fmt,
-            'Contacto': ', '.join(tels),
             'NIF': r['nif'],
             'Nº Cliente': r['nic'],
             'Operadora': r['operadora'],
@@ -949,7 +1040,7 @@ def construir_tabela(registos, prefixo351):
             'Tipo Cliente': tipo_cliente(r['nif'], nome),
             'Outros Dados': ' | '.join(r['outros']),
             'Origem': r['origem'],
-            '_n_tel': len(r['telefones']),
+            '_n_tel': len(tels),
         }
         linhas.append(linha)
 
@@ -963,53 +1054,73 @@ def construir_tabela(registos, prefixo351):
     if 'Data Fidelização' in df.columns:
         df['Data Fidelização'] = pd.to_datetime(df['Data Fidelização'], errors='coerce')
 
-    # Remover colunas opcionais totalmente vazias (mantem Nome Completo e Contacto)
-    obrigatorias = {'Nome Completo', 'Contacto', '_n_tel'}
-    for c in list(df.columns):
-        if c in obrigatorias:
-            continue
-        serie = df[c]
-        if serie.isna().all() or (serie.dtype == object and serie.fillna('').astype(str).str.strip().eq('').all()):
-            df = df.drop(columns=c)
-    if 'Origem' in df.columns and df['Origem'].nunique() <= 1:
-        df = df.drop(columns='Origem')
-    return df
+    df = _limpar_colunas_vazias(df, obrigatorias=('Nome Completo', '_n_tel'))
+    return _aplicar_colunas_contacto(df, listas_tels)
 
 
 def remover_duplicados(df):
-    """Agrupa por NIF, NIC ou Nome: combina contactos e nunca envia cliente com contacto para 'Sem Contacto'."""
+    """Agrupa por NIF, NIC, Nome ou Telefone: combina contactos em colunas (Contacto 1, Contacto 2, ...) sem perder dados."""
     if df.empty:
         return df, 0
 
-    nif_serie = df['NIF'].fillna('').astype(str).str.strip().replace({'<NA>': '', 'nan': '', 'None': '', '0': ''})
-    nic_serie = df['Nº Cliente'].fillna('').astype(str).str.strip().replace({'<NA>': '', 'nan': '', 'None': '', '0': ''}) if 'Nº Cliente' in df.columns else pd.Series('', index=df.index)
-    nome_serie = df['Nome Completo'].fillna('').astype(str).map(lambda s: re.sub(r'\s+', '', sem_acentos(s).upper()))
+    df = df.reset_index(drop=True)
+    listas_tels_orig = _extrair_lista_contactos_df(df)
+
+    def _serie_str(serie):
+        return (serie.astype(str)
+                .str.strip()
+                .replace({'<NA>': '', 'nan': '', 'None': '', 'null': '', '0': '', '0.0': '', 'NaT': ''}))
+
+    if 'NIF' in df.columns:
+        nif_serie = _serie_str(df['NIF'])
+    else:
+        nif_serie = pd.Series('', index=df.index)
+
+    if 'Nº Cliente' in df.columns:
+        nic_serie = _serie_str(df['Nº Cliente'])
+    else:
+        nic_serie = pd.Series('', index=df.index)
+
+    if 'Nome Completo' in df.columns:
+        nome_serie = (_serie_str(df['Nome Completo'])
+                      .map(lambda s: re.sub(r'\s+', '', sem_acentos(s).upper()))
+                      .replace({'<NA>': '', 'NAN': '', 'NONE': ''}))
+    else:
+        nome_serie = pd.Series('', index=df.index)
 
     chaves = []
-    for idx in df.index:
-        nf = nif_serie.at[idx]
-        nc = nic_serie.at[idx]
-        nm = nome_serie.at[idx]
+    for i in range(len(df)):
+        nf = str(nif_serie.iat[i])
+        nc = str(nic_serie.iat[i])
+        nm = str(nome_serie.iat[i])
+        tels_i = listas_tels_orig[i]
         if len(nf) == 9:
             chaves.append(f'NIF:{nf}')
         elif len(nc) >= 6:
             chaves.append(f'NIC:{nc}')
         elif len(nm) >= 4:
             chaves.append(f'NOME:{nm}')
+        elif tels_i and len(tels_i[0]) >= 9:
+            chaves.append(f'TEL:{tels_i[0]}')
         else:
-            chaves.append(f'__UNICA_{idx}')
+            chaves.append(f'__UNICA_{i}')
 
-    df_temp = df.copy()
+    cols_contacto = {c for c in df.columns if c == 'Contacto' or re.fullmatch(r'Contacto \d+', str(c))}
+    cols_base = [c for c in df.columns if c not in cols_contacto]
+
+    df_temp = df[cols_base].copy()
+    df_temp['_idx_orig'] = range(len(df))
     df_temp['chave_grp'] = chaves
-    tem_tel = (df_temp['_n_tel'] > 0).astype(int)
-    riqueza = df_temp.replace('', pd.NA).notna().sum(axis=1)
-    df_temp['score_grp'] = tem_tel * 1000 + df_temp['_n_tel'] * 10 + riqueza
+    n_tel_serie = pd.Series([len(t) for t in listas_tels_orig], index=df.index)
+    df_temp['_n_tel'] = n_tel_serie
+    tem_tel = (n_tel_serie > 0).astype(int)
+    riqueza = df_temp[cols_base].replace('', pd.NA).notna().sum(axis=1)
+    df_temp['score_grp'] = tem_tel * 1000 + n_tel_serie * 10 + riqueza
     df_temp = df_temp.sort_values(by='score_grp', ascending=False, kind='mergesort')
 
-    cols = list(df.columns)
     col_idx = {name: i for i, name in enumerate(df_temp.columns)}
     idx_chave = col_idx['chave_grp']
-    idx_contacto = col_idx.get('Contacto')
+    idx_orig = col_idx['_idx_orig']
 
     grupos = {}
     for row in df_temp.itertuples(index=False, name=None):
@@ -1020,32 +1131,36 @@ def remover_duplicados(df):
             grupos[ch].append(row)
 
     linhas_finais = []
+    listas_tels_finais = []
     for ch, lista in grupos.items():
         primeira = list(lista[0])
         d = dict(zip(df_temp.columns, primeira))
 
-        if len(lista) > 1:
+        if len(lista) == 1:
+            tels = list(listas_tels_orig[primeira[idx_orig]])
+        else:
             tels = []
             for item in lista:
-                c_str = item[idx_contacto] if idx_contacto is not None else ''
-                if c_str and str(c_str).strip():
-                    for t in str(c_str).split(','):
-                        t = t.strip()
-                        if t and t not in tels:
-                            tels.append(t)
-            d['Contacto'] = ', '.join(tels)
-            d['_n_tel'] = len(tels)
+                for t in listas_tels_orig[item[idx_orig]]:
+                    if t not in tels:
+                        tels.append(t)
 
             for item in lista[1:]:
                 item_dict = dict(zip(df_temp.columns, item))
-                for c in ('Morada', 'Localidade', 'Código Postal', 'Email', 'Serviço Atual', 'Data Fidelização'):
-                    if c in d and (not d[c] or pd.isna(d[c])):
+                for c in cols_base:
+                    if c in ('_n_tel', '_idx_orig', 'chave_grp', 'score_grp'):
+                        continue
+                    if c in d and (d[c] is None or pd.isna(d[c]) or str(d[c]).strip() in ('', '<NA>', 'nan', 'None')):
                         val = item_dict.get(c)
-                        if val and not pd.isna(val):
+                        if val is not None and not pd.isna(val) and str(val).strip() not in ('', '<NA>', 'nan', 'None'):
                             d[c] = val
-        linhas_finais.append({c: d[c] for c in cols})
+
+        d['_n_tel'] = len(tels)
+        listas_tels_finais.append(tels)
+        linhas_finais.append({c: d[c] for c in cols_base})
 
     resultado = pd.DataFrame(linhas_finais)
+    resultado = _aplicar_colunas_contacto(resultado, listas_tels_finais)
     dups = len(df) - len(resultado)
     return resultado, dups
 
@@ -1059,9 +1174,10 @@ def _escrever_folha(writer, df, nome_folha):
                                 'align': 'center', 'valign': 'vcenter', 'border': 1, 'text_wrap': True})
     for i, coluna in enumerate(df.columns):
         folha.write(0, i, coluna, fmt_cab)
-        amostra = [celula_texto(v) for v in df[coluna].head(60)]
+        amostra = [celula_texto(v) for v in df[coluna] if celula_texto(v)][:60]
         largura = max([len(str(coluna))] + [len(v) for v in amostra]) + 2
-        folha.set_column(i, i, min(max(largura, 10), 50))
+        min_largura = 14 if str(coluna).startswith('Contacto') else 10
+        folha.set_column(i, i, min(max(largura, min_largura), 50))
     folha.set_row(0, 24)
     folha.freeze_panes(1, 0)
     if len(df):
@@ -1084,7 +1200,7 @@ def gravar_csv(caminho, df):
         if pd.api.types.is_datetime64_any_dtype(saida['Data Fidelização']):
             saida['Data Fidelização'] = saida['Data Fidelização'].dt.strftime('%d/%m/%Y').fillna('')
     for c in saida.columns:
-        if saida[c].dtype == object:  # evita formulas maliciosas ao abrir no Excel
+        if pd.api.types.is_string_dtype(saida[c]):  # evita formulas maliciosas ao abrir no Excel
             saida[c] = saida[c].map(lambda v: "'" + v if isinstance(v, str) and v[:1] in ('=', '@') else v)
     saida.to_csv(caminho, index=False, encoding='utf-8')
 
@@ -1122,7 +1238,8 @@ def gerar_resultado(registos, pasta, base, prefixo351):
         'duplicados': int(duplicados),
     }
     df = df.drop(columns='_n_tel')
-    df_com, df_sem = df[tem_tel.values], df[~tem_tel.values]
+    df_com = _limpar_colunas_vazias(df[tem_tel.values].copy(), obrigatorias=('Nome Completo', 'Contacto 1'))
+    df_sem = _limpar_colunas_vazias(df[~tem_tel.values].copy(), obrigatorias=('Nome Completo', 'Contacto 1'))
 
     nome_xlsx = f'{base}_organizado.xlsx'
     nome_csv = f'{base}_CallHub.csv'
