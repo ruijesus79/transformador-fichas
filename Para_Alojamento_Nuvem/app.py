@@ -370,8 +370,10 @@ HTML_TEMPLATE = r"""
                     <div>${botoes}</div>
                     <button class="btn btn-reset" onclick="resetForm()">&#128260; Novo(s) ficheiro(s)</button>
                     <div class="note">
-                        O ficheiro CSV (verde) contém apenas os clientes com contacto e está pronto a importar no CallHub.<br>
+                        <b>Para abrir e ver os dados separados por colunas, usa o ficheiro Excel (.xlsx).</b><br>
                         O Excel tem a folha "Clientes" e, se existirem, a folha "Sem Contacto".<br>
+                        O ficheiro CSV (verde) serve só para importar no CallHub. Se o abrires no Excel em português,
+                        os dados aparecem todos na coluna A (o Excel PT usa ";" e o CallHub usa ","). Isto é normal.<br>
                         Por privacidade, os ficheiros são apagados do servidor ao fim de ${data.validade_minutos} minutos.
                     </div>
                 </div>`;
@@ -1202,7 +1204,8 @@ def gravar_csv(caminho, df):
     for c in saida.columns:
         if pd.api.types.is_string_dtype(saida[c]):  # evita formulas maliciosas ao abrir no Excel
             saida[c] = saida[c].map(lambda v: "'" + v if isinstance(v, str) and v[:1] in ('=', '@') else v)
-    saida.to_csv(caminho, index=False, encoding='utf-8')
+    # utf-8-sig (com BOM) para o Excel mostrar bem os acentos (Nº, Serviço, Fidelização)
+    saida.to_csv(caminho, index=False, encoding='utf-8-sig')
 
 
 def nome_base_seguro(nome_ficheiro):
@@ -1320,8 +1323,8 @@ def transformar():
             del todos
             gc.collect()
             downloads = [
-                {'label': 'Descarregar CSV para CallHub', 'tipo': 'csv', 'url': f'/descarregar/{token}/{nomes[1]}'},
-                {'label': 'Descarregar Excel', 'tipo': 'xlsx', 'url': f'/descarregar/{token}/{nomes[0]}'},
+                {'label': 'Descarregar Excel (abrir e ver por colunas)', 'tipo': 'xlsx', 'url': f'/descarregar/{token}/{nomes[0]}'},
+                {'label': 'Descarregar CSV (só para importar no CallHub)', 'tipo': 'csv', 'url': f'/descarregar/{token}/{nomes[1]}'},
             ]
         else:
             stats = {'clientes': 0, 'com_contacto': 0, 'sem_contacto': 0, 'multi_contacto': 0, 'duplicados': 0}
